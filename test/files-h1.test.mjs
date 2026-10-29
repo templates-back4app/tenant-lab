@@ -17,7 +17,9 @@ before(async () => {
 after(async () => { await h.cleanup(); });
 
 test('H1a upload path: only members attach, and only to their tenant\'s tasks', async () => {
-  assert.ok(att.url.includes('/files/'), `attachFile returned a file URL`);
+  // Local parse-server serves /parse/files/<appId>/<name>; Back4app serves parsefiles.back4app.com/<appId>/<name>.
+  // Assert the shape that holds on both: an absolute http(s) URL whose path ends in the stored file name.
+  assert.ok(/^https?:\/\//.test(att.url) && att.url.endsWith(att.name), `attachFile returned a file URL (got ${att.url})`);
   const foreign = await h.call('attachFile', { taskId: w.acmeTask2, name: 'x.txt', base64: 'eA==' }, w.borealisMember.token);
   assert.equal(foreign.error.code, 'OBJECT_NOT_FOUND', 'a Borealis member cannot attach to an ACME task');
   const anon = await h.call('attachFile', { taskId: w.acmeTask, name: 'x.txt', base64: 'eA==' });
