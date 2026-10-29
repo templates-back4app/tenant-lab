@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.*
+!.env.example
+*.local.json
+.DS_Store
+logs/
+.files/
+docs/evidence/.rows-local.jsonl

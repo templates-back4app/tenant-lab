@@ -1,0 +1,4 @@
+{
+  "type": "commonjs",
+  "description": "cloud/*.js is CommonJS (what Back4app runs). The root package.json says type=module for the scripts; without this file Node would load main.js as ESM and `require('./config.js')` would be undefined. Not uploaded to Back4app."
+}
