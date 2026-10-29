@@ -20,10 +20,11 @@ test('R1 hierarchy direction: the member role contains the admin role, and only 
   // Database state: tenant_<id>_member's roles relation contains tenant_<id>_admin.
   const memberRole = (await h.master('_Role', { name: `tenant_${w.acme}_member` }))[0];
   const adminRole = (await h.master('_Role', { name: `tenant_${w.acme}_admin` }))[0];
-  const nested = await h.master('_Role', { $relatedTo: { object: ptr('_Role', memberRole.objectId), key: 'roles' } });
-  assert.deepEqual(nested.map((r) => r.objectId), [adminRole.objectId], 'member.roles = [admin]');
-  const reverse = await h.master('_Role', { $relatedTo: { object: ptr('_Role', adminRole.objectId), key: 'roles' } });
-  assert.deepEqual(reverse, [], 'admin.roles is empty — members never inherit admin');
+  // Equality on a relation column: "the member role whose roles relation contains the admin role".
+  const nested = await h.master('_Role', { name: `tenant_${w.acme}_member`, roles: ptr('_Role', adminRole.objectId) });
+  assert.deepEqual(nested.map((r) => r.objectId), [memberRole.objectId], 'member.roles contains admin');
+  const reverse = await h.master('_Role', { name: `tenant_${w.acme}_admin`, roles: ptr('_Role', memberRole.objectId) });
+  assert.deepEqual(reverse, [], 'admin.roles does not contain member — members never inherit admin');
   // Direct role membership: the admin user is ONLY in the admin role; the member only in the member role.
   assert.equal((await h.master('_Role', { name: `tenant_${w.acme}_admin`, users: ptr('_User', w.acmeAdmin.objectId) })).length, 1);
   assert.equal((await h.master('_Role', { name: `tenant_${w.acme}_member`, users: ptr('_User', w.acmeAdmin.objectId) })).length, 0,
@@ -111,7 +112,8 @@ test('R4 membership helper negatives: non-member, removed member, deleted tenant
   });
 });
 
-test('R5 reconciliation: a missing role entry is restored from the Membership row by myTenants', async () => {
+test('R5 reconciliation: a missing role entry is restored from the Membership row by myTenants', async (t) => {
+  if (h.liveSkip(t, 'simulating the half-granted state needs a master-key role edit — recorded in the local evidence')) return;
   // Simulate the half-granted state (crash between Membership write and role write): remove the role entry.
   const user = await h.addMember(w.acmeAdmin.token, w.acme, 'member', 'r5_member');
   const before = await h.rest('GET', '/classes/Task', undefined, { session: user.token });

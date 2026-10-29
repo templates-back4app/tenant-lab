@@ -11,9 +11,9 @@
 //
 // Synthetic data only — never run against a backend with real tenants. The deterministic passwords below are
 // for throwaway benchmark users; the pattern is NOT for real accounts.
-import crypto from 'node:crypto';
 import { target, args } from './lib/env.mjs';
 import { makeClient, tokenBucket, parseCloudError } from './lib/rest.mjs';
+import { seedUsername, seedPassword, seedEmail } from './lib/seed-identity.mjs';
 
 const a = args();
 const env = target(a);
@@ -32,9 +32,9 @@ if (!nTenants && !join) {
   process.exit(2);
 }
 
-const username = (kind, i) => `seed-${seed}-${kind}${i === undefined ? '' : '-' + i}`;
-const pw = (user) => 'Pw-' + crypto.createHash('sha256').update(`${seed}:${user}:tenant-lab`).digest('base64url').slice(0, 18);
-const email = (user) => `${user}@seed.example.test`;
+const username = (kind, i) => seedUsername(seed, kind, i);
+const pw = (user) => seedPassword(seed, user);
+const email = (user) => seedEmail(user);
 
 async function req(method, path, opts) {
   await bucket.take();

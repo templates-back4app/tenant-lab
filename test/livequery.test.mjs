@@ -14,7 +14,8 @@ before(async () => {
 });
 after(async () => { await h.cleanup(); });
 
-test('T8 an unfiltered Task subscription delivers only the subscriber\'s tenant: Borealis writes never arrive', async () => {
+test('T8 an unfiltered Task subscription delivers only the subscriber\'s tenant: Borealis writes never arrive', async (t) => {
+  if (!h.liveQueryAvailable) { t.skip('live run: enable Task under Dashboard → App Settings → Server Settings → Live Query and set LIVEQUERY_URL=wss://<subdomain>.b4a.io'); return; }
   const sub = await h.subscribe({ session: w.acmeMember.token });
   // Borealis writes first, then an ACME write as the ordering sentinel: if the ACME event arrives and no
   // Borealis event is in the backlog, the Borealis events were filtered, not merely slow.
@@ -38,7 +39,8 @@ test('T8 an unfiltered Task subscription delivers only the subscriber\'s tenant:
   });
 });
 
-test('T9 (subscription half) a removed member\'s open subscription stops receiving within the auth-cache window', async () => {
+test('T9 (subscription half) a removed member\'s open subscription stops receiving within the auth-cache window', async (t) => {
+  if (!h.liveQueryAvailable) { t.skip('live run: enable Task under Dashboard → App Settings → Server Settings → Live Query and set LIVEQUERY_URL=wss://<subdomain>.b4a.io'); return; }
   const victim = await h.addMember(w.acmeAdmin.token, w.acme, 'member', 't9lq_victim');
   const sub = await h.subscribe({ session: victim.token });
   const warm = await mustCall(h, 'createTask', { tenantId: w.acme, projectId: w.acmeProject, title: 'T9lq before removal' }, w.acmeAdmin.token);

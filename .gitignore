@@ -6,4 +6,4 @@ node_modules/
 .DS_Store
 logs/
 .files/
-docs/evidence/.rows-local.jsonl
+docs/evidence/.rows-*.jsonl

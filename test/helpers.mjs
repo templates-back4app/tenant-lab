@@ -1,13 +1,20 @@
 // File: test/helpers.mjs · shared by the node:test suites. Raw REST only — no Parse SDK, no browser.
 //
 // Target: by default an in-process parse-server (scripts/dev-server.mjs) on a free port with the database
-// postgres://localhost:5433/tenant_test, purged at the start of every suite file. Set TEST_SERVER_URL (+ keys
-// in .env) to run the same suite against a live backend later — DO NOT do that in Phase A; the live rows of
-// the evidence matrix are produced in the live phase.
+// postgres://localhost:5433/tenant_test, purged at the start of every suite file. For the LIVE run:
+//
+//   TEST_SERVER_URL=https://parseapi.back4app.com npm test
+//
+// which loads the keys from .env.live (APP_ID, JS_KEY, REST_KEY — never the master key), uses the
+// SETUP_ENABLED-gated Cloud helpers instead of master-key REST (setupSchema for the schema, testInspect for
+// every state read-back, testCleanup to delete what the run created), and SKIPS, with a printed reason, the
+// parts that need direct master/database access (hook-vs-master-key probes, failure simulations, SQL
+// corruption). Every object a run creates carries the per-execution RUN prefix in its username/tenant name,
+// so parallel or crashed runs never collide and cleanup can only ever sweep its own run.
 //
 // Every suite records matrix rows (persona, attempt, HTTP/Parse code, body assertion, state assertion) into
-// docs/evidence/.rows-local.jsonl; `npm test` regenerates docs/evidence/isolation-matrix-local-<date>.md from
-// them afterwards (scripts/evidence.mjs, wired as pretest/posttest).
+// docs/evidence/.rows-<target>.jsonl; `npm test` regenerates docs/evidence/isolation-matrix-<target>-<date>.md
+// from them afterwards (scripts/evidence.mjs, wired as pretest/posttest).
 import { createServer } from 'node:net';
 import crypto from 'node:crypto';
 import { appendFileSync, mkdirSync } from 'node:fs';
@@ -18,10 +25,15 @@ import { makeClient, parseCloudError, where, sleep } from '../scripts/lib/rest.m
 import { applySchema } from '../scripts/setup.mjs';
 
 export { where, sleep, parseCloudError };
-export const unique = (prefix) => `${prefix}_${crypto.randomBytes(5).toString('hex')}`;
+/** Per-execution run prefix: every username and tenant name carries it (shape enforced by testCleanup). */
+export const RUN = 'zz' + Date.now().toString(36) + crypto.randomBytes(3).toString('hex');
+export const unique = (prefix) => `${RUN}_${prefix}_${crypto.randomBytes(3).toString('hex')}`;
 export const password = () => 'Pw-' + crypto.randomBytes(9).toString('base64url');
 
-const ROWS_FILE = path.join(ROOT, 'docs', 'evidence', '.rows-local.jsonl');
+/** Evidence label: 'back4app' only for the real live host — a localhost TEST_SERVER_URL is a rehearsal. */
+export const TARGET = !process.env.TEST_SERVER_URL ? 'local'
+  : /back4app\.com/.test(process.env.TEST_SERVER_URL) ? 'back4app' : 'remote-rehearsal';
+const ROWS_FILE = path.join(ROOT, 'docs', 'evidence', `.rows-${TARGET}.jsonl`);
 
 const freePort = () => new Promise((resolve, reject) => {
   const s = createServer(); s.unref();
@@ -29,36 +41,64 @@ const freePort = () => new Promise((resolve, reject) => {
   s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); });
 });
 
-/** Starts (or attaches to) the server, applies the schema, purges local data. */
+/** Starts (or attaches to) the server, applies the schema, purges local data (local) / nothing (live). */
 export async function harness({ suite } = {}) {
-  loadDotEnv();
   let env; let handle = null; let isLocal = true;
   if (process.env.TEST_SERVER_URL) {
     isLocal = false;
+    loadDotEnv(path.join(ROOT, '.env.live')); // live keys live here; never printed, never committed
+    loadDotEnv();
     env = {
-      name: 'remote',
+      name: TARGET,
       APP_ID: process.env.APP_ID, JS_KEY: process.env.JS_KEY || '', REST_KEY: process.env.REST_KEY || '',
       MASTER_KEY: process.env.MASTER_KEY || '', SERVER_URL: process.env.TEST_SERVER_URL.replace(/\/+$/, ''),
     };
+    if (!env.APP_ID) throw new Error('TEST_SERVER_URL is set but APP_ID is missing — fill .env.live first.');
   } else {
+    loadDotEnv();
     const { startServer } = await import('../scripts/dev-server.mjs');
     const port = await freePort();
     handle = await startServer({ port, databaseURI: process.env.TEST_DATABASE_URL || 'postgres://localhost:5433/tenant_test', quiet: true });
     env = { ...LOCAL, name: 'local-test', SERVER_URL: handle.url };
   }
-  const api = makeClient(env);
+  const api = makeClient(env, { retry: !isLocal }); // live: retry Back4app's 155 throttle with backoff
+  const canMaster = !!env.MASTER_KEY;
 
-  if (isLocal) {
+  if (canMaster) {
     await applySchema(env);
-    // Purge everything from previous runs so counts (T6) and state assertions are deterministic.
-    for (const cls of ['Task', 'Project', 'Invite', 'Membership', 'FileMeta', 'Tenant', '_Role', '_Session', '_User']) {
+  } else {
+    // No master key: the schema goes through the SETUP_ENABLED-gated Cloud function. allowRerun, because a
+    // live backend that already ran the suite holds tenants and would trip setupSchema's rerun tripwire.
+    const setup = await api.call('setupSchema', { allowRerun: true });
+    if (!setup.ok) {
+      const why = setup.error.code === 'SETUP_DISABLED' ? 'cloud/config.js has SETUP_ENABLED=false on this backend'
+        : /Invalid function/.test(setup.error.message || '') ? 'Cloud Code is not deployed (upload main.js, config.js, guards.js and Deploy — verify with a request)'
+        : `HTTP ${setup.status} ${JSON.stringify(setup.error)}`;
+      throw new Error(`setupSchema failed: ${why}`);
+    }
+  }
+  if (isLocal) {
+    // Purge everything from previous runs so counts (T6) and state assertions are deterministic. Live runs
+    // never purge: isolation scoping keeps foreign rows invisible, and testCleanup removes this run's rows.
+    for (const cls of ['Task', 'Project', 'Invite', 'Membership', 'FileMeta', 'Tenant', '_Session', '_User', '_Role']) {
       await api.request('DELETE', `/purge/${cls}`, { master: true });
     }
   }
 
   const observations = [];
   const h = {
-    env, api, isLocal, observations, suite: suite || 'suite',
+    env, api, isLocal, canMaster, observations, suite: suite || 'suite',
+
+    /**
+     * Skip helper for live runs: parts that need the master key or direct database access (hook-vs-master
+     * probes, failure simulations, SQL corruption) run locally and print a reason live. Usage:
+     *   if (h.liveSkip(t, 'needs master-key writes — hook layer proven in the local run')) return;
+     */
+    liveSkip(t, reason) {
+      if (canMaster) return false;
+      t.skip(`live run: ${reason}`);
+      return true;
+    },
 
     observe(label, value) { observations.push({ label, value }); },
 
@@ -74,11 +114,19 @@ export async function harness({ suite } = {}) {
     /** Cloud call with the envelope unwrapped: {ok, status, result | error:{parseCode, code, message}} */
     call: (name, params, session) => api.call(name, params || {}, { session }),
 
-    /** Master-key read-back for STATE assertions (local only — the live phase gets its own gated path). */
-    async master(className, whereObj, extra = '') {
-      const r = await api.request('GET', `/classes/${className}?where=${where(whereObj)}${extra}`, { master: true });
-      if (r.status !== 200) throw new Error(`master read ${className} failed: ${r.status} ${JSON.stringify(r.json)}`);
-      return r.json.results;
+    /**
+     * Master-rights read-back for STATE assertions (equality-where only). Locally: REST with the master key.
+     * Live: the SETUP_ENABLED-gated Cloud function testInspect — the master key never leaves the dashboard.
+     */
+    async master(className, whereObj) {
+      if (canMaster) {
+        const r = await api.request('GET', `/classes/${className}?where=${where(whereObj)}`, { master: true });
+        if (r.status !== 200) throw new Error(`master read ${className} failed: ${r.status} ${JSON.stringify(r.json)}`);
+        return r.json.results;
+      }
+      const r = await api.call('testInspect', { className, where: whereObj, limit: 1000 });
+      if (!r.ok) throw new Error(`testInspect ${className} failed: ${JSON.stringify(r.error)}`);
+      return r.result.results;
     },
 
     // ---- personas --------------------------------------------------------------------------------------
@@ -113,9 +161,9 @@ export async function harness({ suite } = {}) {
      */
     async world() {
       const acmeAdmin = await h.signUp('acme_admin');
-      const acme = (await mustCall(h, 'createTenant', { name: 'ACME ' + unique('inc') }, acmeAdmin.token)).tenantId;
+      const acme = (await mustCall(h, 'createTenant', { name: `ACME ${RUN}` }, acmeAdmin.token)).tenantId;
       const borealisAdmin = await h.signUp('borealis_admin');
-      const borealis = (await mustCall(h, 'createTenant', { name: 'Borealis ' + unique('gmbh') }, borealisAdmin.token)).tenantId;
+      const borealis = (await mustCall(h, 'createTenant', { name: `Borealis ${RUN}` }, borealisAdmin.token)).tenantId;
 
       const acmeMember = await h.addMember(acmeAdmin.token, acme, 'member', 'acme_member');
       const borealisMember = await h.addMember(borealisAdmin.token, borealis, 'member', 'borealis_member');
@@ -147,7 +195,9 @@ export async function harness({ suite } = {}) {
      * `events` collects every op:create/update/delete/enter/leave message received.
      */
     async subscribe({ className = 'Task', whereObj = {}, session }) {
-      const wsUrl = env.SERVER_URL.replace(/^http/, 'ws');
+      // Back4app LiveQuery runs on its own host: enable Task under Server Settings → Live Query in the
+      // dashboard and pass LIVEQUERY_URL=wss://<subdomain>.b4a.io; locally the dev server speaks ws itself.
+      const wsUrl = process.env.LIVEQUERY_URL || env.SERVER_URL.replace(/^http/, 'ws');
       const ws = new WebSocket(wsUrl);
       const events = [];
       const waiters = [];
@@ -200,8 +250,18 @@ export async function harness({ suite } = {}) {
       };
     },
 
+    /** True when a LiveQuery test can run against this target. */
+    liveQueryAvailable: isLocal || !!process.env.LIVEQUERY_URL,
+
     async cleanup() {
       printObservations(`${h.suite} observations`, observations);
+      if (!isLocal) {
+        // Delete ONLY what this run created: tenants whose name carries RUN, users whose username starts
+        // with RUN and are < 2 h old (plus their sessions). Gated by SETUP_ENABLED like the other helpers.
+        const r = await api.call('testCleanup', { runPrefix: RUN });
+        if (r.ok) console.log(`cleanup: testCleanup(${RUN}) removed ${JSON.stringify(r.result)}`);
+        else console.log(`cleanup: testCleanup failed (${r.error.code}) — rows with prefix ${RUN} remain on the backend`);
+      }
       if (handle) await handle.close();
     },
   };

@@ -212,6 +212,8 @@ const GUARDS = {
   deleteProject: 'admin',
   deleteTenant: 'admin',
   setupSchema: 'setup',
+  testInspect: 'setup',  // live test runs: master-key state read-backs without the master key leaving the dashboard
+  testCleanup: 'setup',  // live test runs: delete ONLY what a suite run created (its run prefix, users < 2 h old)
   demoTaskById: 'demo-unguarded', // T10: only registered when config.DEMO_UNGUARDED (never in a default deploy)
 };
 
@@ -502,85 +504,92 @@ define('deleteTenant', {
     if (typeof budget !== 'number' || !Number.isInteger(budget) || budget < 1) {
       fail('INVALID_ARGS', 'budget must be a positive integer', { field: 'budget' });
     }
-    const tenant = ctx.tenant;
-    if (tenant.get('status') !== 'deleting') {
-      tenant.set('status', 'deleting'); // from here the hooks refuse every new write into this tenant
-      await tenant.save(null, MASTER);
+    const r = await wipeTenant(ctx.tenant, budget);
+    return { done: r.done, deleted: r.deleted, budget: budget };
+  },
+});
+
+// The sweep deleteTenant and testCleanup share. Order: files, FileMeta, Task, Project, Invite — then roles
+// (reads die), memberships, and the Tenant row last. Stops when `budget` delete operations are spent
+// (done:false); calling again resumes.
+async function wipeTenant(tenant, budget) {
+  if (tenant.get('status') !== 'deleting') {
+    tenant.set('status', 'deleting'); // from here the hooks refuse every new write into this tenant
+    await tenant.save(null, MASTER);
+  }
+
+  let ops = 0;
+  const deleted = { files: 0, fileMeta: 0, tasks: 0, projects: 0, invites: 0, memberships: 0, roles: 0, tenant: 0 };
+  const out = function (done) { return { done: done, deleted: deleted, ops: ops }; };
+
+  // Attachment files first (while FileMeta still knows their names), then the rows, page by page.
+  for (;;) {
+    if (ops >= budget) return out(false);
+    const q = new Parse.Query('FileMeta');
+    q.equalTo('tenant', tenant);
+    q.limit(Math.min(config.DELETE_PAGE_SIZE, budget - ops));
+    const metas = await q.find(MASTER);
+    if (!metas.length) break;
+    for (const meta of metas) {
+      const file = new Parse.File(meta.get('fileName'));
+      try {
+        await file.destroy(MASTER);
+        deleted.files++;
+      } catch (e) {
+        // Already gone (retry) or the adapter cannot delete; the row still goes, and T15 measures what is
+        // left reachable.
+      }
     }
+    await Parse.Object.destroyAll(metas, MASTER);
+    deleted.fileMeta += metas.length;
+    ops += metas.length;
+  }
 
-    let ops = 0;
-    const deleted = { files: 0, fileMeta: 0, tasks: 0, projects: 0, invites: 0, memberships: 0, roles: 0, tenant: 0 };
-    const out = function (done) { return { done: done, deleted: deleted, budget: budget }; };
-
-    // Attachment files first (while FileMeta still knows their names), then the rows, page by page.
+  for (const step of [
+    { className: 'Task', key: 'tasks' },
+    { className: 'Project', key: 'projects' },
+    { className: 'Invite', key: 'invites' },
+  ]) {
     for (;;) {
       if (ops >= budget) return out(false);
-      const q = new Parse.Query('FileMeta');
-      q.equalTo('tenant', tenant);
-      q.limit(Math.min(config.DELETE_PAGE_SIZE, budget - ops));
-      const metas = await q.find(MASTER);
-      if (!metas.length) break;
-      for (const meta of metas) {
-        const file = new Parse.File(meta.get('fileName'));
-        try {
-          await file.destroy(MASTER);
-          deleted.files++;
-        } catch (e) {
-          // Already gone (retry) or the adapter cannot delete; the row still goes, and T15 measures what is
-          // left reachable.
-        }
-      }
-      await Parse.Object.destroyAll(metas, MASTER);
-      deleted.fileMeta += metas.length;
-      ops += metas.length;
-    }
-
-    for (const step of [
-      { className: 'Task', key: 'tasks' },
-      { className: 'Project', key: 'projects' },
-      { className: 'Invite', key: 'invites' },
-    ]) {
-      for (;;) {
-        if (ops >= budget) return out(false);
-        const q = new Parse.Query(step.className);
-        q.equalTo('tenant', tenant);
-        q.limit(Math.min(config.DELETE_PAGE_SIZE, budget - ops));
-        const rows = await q.find(MASTER);
-        if (!rows.length) break;
-        await Parse.Object.destroyAll(rows, MASTER);
-        deleted[step.key] += rows.length;
-        ops += rows.length;
-      }
-    }
-
-    // Roles before memberships: once the roles are gone no row of this tenant is readable by anyone.
-    for (const kind of config.MEMBERSHIP_ROLES) {
-      const role = await findRole(config.roleName(tenant.id, kind));
-      if (role) {
-        if (ops >= budget) return out(false);
-        await role.destroy(MASTER);
-        deleted.roles++;
-        ops++;
-      }
-    }
-
-    for (;;) {
-      if (ops >= budget) return out(false);
-      const q = new Parse.Query('Membership');
+      const q = new Parse.Query(step.className);
       q.equalTo('tenant', tenant);
       q.limit(Math.min(config.DELETE_PAGE_SIZE, budget - ops));
       const rows = await q.find(MASTER);
       if (!rows.length) break;
       await Parse.Object.destroyAll(rows, MASTER);
-      deleted.memberships += rows.length;
+      deleted[step.key] += rows.length;
       ops += rows.length;
     }
+  }
 
-    await tenant.destroy(MASTER);
-    deleted.tenant = 1;
-    return out(true);
-  },
-});
+  // Roles before memberships: once the roles are gone no row of this tenant is readable by anyone.
+  for (const kind of config.MEMBERSHIP_ROLES) {
+    const role = await findRole(config.roleName(tenant.id, kind));
+    if (role) {
+      if (ops >= budget) return out(false);
+      await role.destroy(MASTER);
+      deleted.roles++;
+      ops++;
+    }
+  }
+
+  for (;;) {
+    if (ops >= budget) return out(false);
+    const q = new Parse.Query('Membership');
+    q.equalTo('tenant', tenant);
+    q.limit(Math.min(config.DELETE_PAGE_SIZE, budget - ops));
+    const rows = await q.find(MASTER);
+    if (!rows.length) break;
+    await Parse.Object.destroyAll(rows, MASTER);
+    deleted.memberships += rows.length;
+    ops += rows.length;
+  }
+
+  await tenant.destroy(MASTER);
+  deleted.tenant = 1;
+  return out(true);
+}
 
 // ---------------------------------------------------------------------------------------------------------
 // 5. Projects and tasks (per-tenant data)
@@ -836,7 +845,111 @@ define('setupSchema', {
   },
 });
 
+// ---------------------------------------------------------------------------------------------------------
+// 8b. Live-run test helpers (behind the same SETUP_ENABLED). Why they exist: on Back4app the master key stays
+// in the dashboard, but the suite's STATE assertions read rows back with master rights and its teardown must
+// delete what it created. Cloud Code runs with master rights, so these do it on the caller's behalf. Nothing
+// authenticates the caller — that is what SETUP_ENABLED is for; switch it off before real users arrive.
+// ---------------------------------------------------------------------------------------------------------
+
+const INSPECT_CLASSES = config.SCHEMA.map(function (d) { return d.className; }).concat(['_Role', '_User']);
+
+// Parse Server may hand Cloud functions their params already decoded (pointers as Parse.Object) or raw
+// (REST JSON, as on Back4app). Normalize either into what Parse.Query accepts.
+function decodeParam(value) {
+  if (value instanceof Parse.Object || value instanceof Date) return value;
+  return Parse._decode(null, value);
+}
+
+// A Parse.Query from a `where` object of field → value EQUALITIES (values REST-encoded: a pointer is
+// {__type:'Pointer',…}, a date {__type:'Date', iso}). Operators ($in, $regex, …) are not accepted; an
+// equality on a relation column (e.g. _Role.users or _Role.roles against a pointer) works and is how the
+// suite asserts role state. Same pattern as the sibling repo.
+function queryFromWhere(className, where) {
+  const q = new Parse.Query(className);
+  Object.keys(where).forEach(function (key) {
+    const value = decodeParam(where[key]);
+    if (value && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Parse.Object) && !(value instanceof Date) && !(value instanceof Parse.File)) {
+      fail('INVALID_ARGS', 'where.' + key + ' must be a plain value or a REST-encoded pointer/date (no operators)', { field: 'where.' + key });
+    }
+    q.equalTo(key, value);
+  });
+  return q;
+}
+
+// testInspect({className, where?, limit?, count?}) → {results:[toJSON…]} or {count}. Master-rights read of one
+// whitelisted class, equality-where only. The live suite's state assertions run through this.
+define('testInspect', {
+  handler: async function (request) {
+    const p = request.params || {};
+    if (INSPECT_CLASSES.indexOf(p.className) === -1) {
+      fail('INVALID_ARGS', 'className must be one of ' + INSPECT_CLASSES.join(', '), { field: 'className' });
+    }
+    const where = p.where === undefined ? {} : p.where;
+    if (!where || typeof where !== 'object' || Array.isArray(where)) fail('INVALID_ARGS', 'where must be an object', { field: 'where' });
+    const q = queryFromWhere(p.className, where);
+    if (p.count === true) return { className: p.className, count: await q.count(MASTER) };
+    const limit = p.limit === undefined ? 100 : p.limit;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) fail('INVALID_ARGS', 'limit must be an integer in 1..1000', { field: 'limit' });
+    q.limit(limit);
+    q.ascending('createdAt');
+    const rows = await q.find(MASTER);
+    return { className: p.className, results: rows.map(function (r) { return r.toJSON(); }) };
+  },
+});
+
+// testCleanup({runPrefix}) → {tenants, users, sessions}. Deletes ONLY what one suite run created:
+//   - every Tenant whose name contains the run prefix (full wipeTenant sweep: rows, roles, files), and
+//   - every _User whose username starts with the prefix AND was created less than 2 hours ago (+ its sessions).
+// The prefix shape is enforced (zz + ≥8 base36 chars, as test/helpers.mjs generates) so a stray call can
+// never sweep real tenants or users. Parallel runs have distinct prefixes and never touch each other.
+define('testCleanup', {
+  handler: async function (request) {
+    const p = request.params || {};
+    if (typeof p.runPrefix !== 'string' || !/^zz[a-z0-9]{8,32}$/.test(p.runPrefix)) {
+      fail('INVALID_ARGS', 'runPrefix must match ^zz[a-z0-9]{8,32}$ (the suite run prefix)', { field: 'runPrefix' });
+    }
+    const counts = { tenants: 0, users: 0, sessions: 0 };
+    for (;;) {
+      const tq = new Parse.Query('Tenant');
+      tq.contains('name', p.runPrefix);
+      tq.limit(20);
+      const tenants = await tq.find(MASTER);
+      if (!tenants.length) break;
+      for (const tenant of tenants) {
+        let r;
+        do { r = await wipeTenant(tenant, config.DELETE_DEFAULT_BUDGET); } while (!r.done);
+        counts.tenants++;
+      }
+    }
+    const cutoff = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    for (;;) {
+      const uq = new Parse.Query('_User');
+      uq.startsWith('username', p.runPrefix);
+      uq.greaterThan('createdAt', cutoff);
+      uq.limit(100);
+      const users = await uq.find(MASTER);
+      if (!users.length) break;
+      const sq = new Parse.Query('_Session');
+      sq.containedIn('user', users);
+      sq.limit(1000);
+      const sessions = await sq.find(MASTER);
+      if (sessions.length) await Parse.Object.destroyAll(sessions, MASTER);
+      counts.sessions += sessions.length;
+      await Parse.Object.destroyAll(users, MASTER);
+      counts.users += users.length;
+    }
+    return counts;
+  },
+});
+
 registry.assertAllRegistered();
+
+// getAttachment relies on global fetch (Node 18+; Back4app Cloud Code runs Node 19). Log — never throw — when
+// it is missing, so a deploy on an older runtime degrades that one function instead of the whole app.
+if (typeof fetch !== 'function') {
+  console.log('tenant-lab warning: global fetch is not available in this Cloud Code runtime — getAttachment will fail; port it to Parse.Cloud.httpRequest.');
+}
 
 // ---------------------------------------------------------------------------------------------------------
 // 9. Hooks: the second guard. They run for EVERY write, master key included, so a Cloud function that forgot

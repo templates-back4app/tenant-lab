@@ -8,7 +8,7 @@ compared in `local-vs-live.md` (live phase). Every assertion checks the response
 
 | # | Persona | Attempt | HTTP / code | Body assertion | State assertion |
 |---|---|---|---|---|---|
-| T7 | anonymous (URL holder) | GET the Parse File URL with no App ID, key or session | 200 ·  | the full file contents are served — H1 SUPPORTED on the local server | the Task row itself stays invisible to anonymous reads (T14); only the file URL leaks. Back4app: TO MEASURE (live) |
+| T7 | anonymous (URL holder) | GET the Parse File URL with no App ID, key or session | 200 ·  | the full file contents are served — H1 SUPPORTED on this target | the Task row itself stays invisible to anonymous reads (T14); only the file URL leaks. Back4app: TO MEASURE (live) |
 | H1a | ACME member / Borealis member / anonymous | attachFile to an own task, to a foreign task, without a session; direct POST /files | 200 / 404 / 400 / 400 · ok / OBJECT_NOT_FOUND / 209 / 130 | only the member upload succeeds | FileMeta maps the stored file name to the ACME tenant |
 | H1c | member/admin/foreign/anonymous/removed | getAttachment for each persona; then GET the raw URL again | 200/404/400 + raw 200 · ok / ok / OBJECT_NOT_FOUND / 209 / OBJECT_NOT_FOUND; raw URL still 200 | the function path enforces membership; the underlying URL is unchanged by it | LOCAL conclusion: membership-checked delivery works, but the raw URL stays public → attachments excluded from the local isolation claim. Back4app raw-URL behaviour and any signed-URL option: TO MEASURE (live) |
 

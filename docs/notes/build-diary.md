@@ -114,3 +114,60 @@ Local only: parse-server 7.5.4, Postgres 17 on :5433, Node 25 (engines >=22). No
    (Free plan cap vs 1,000 tenants) before the live run.
 
 Next: hand back for the live phase. Nothing in this repo has been pushed anywhere.
+
+## 2026-10-29 (later) — live-run preparation, still local only
+
+The live backend exists (tenant-lab, Parse 7.5.2, MongoDB, USA East, Free plan; keys in `.env.live`,
+gitignored). Nothing here has called it — this entry is the preparation work, verified against a local
+rehearsal.
+
+**What changed**
+
+- `cloud/main.js`: + `testInspect` (master-rights read of a whitelisted class, equality-where only — an
+  equality against a relation column works and is how R1 asserts the role nesting now, replacing the local
+  `$relatedTo` query) and + `testCleanup` (deletes ONLY one run's objects: tenants whose name carries the
+  run's `zz…` prefix via the extracted `wipeTenant` sweep, users `startsWith(username, prefix)` AND younger
+  than 2 h, plus their sessions; prefix shape enforced server-side). Both behind the same SETUP_ENABLED as
+  `setupSchema`, which was already idempotent — the harness passes `allowRerun:true` live because an
+  already-run backend holds tenants and would trip the rerun tripwire. Also: a load-time `console.log`
+  warning (never a throw) if the runtime has no global `fetch` — `getAttachment` would then need porting to
+  `Parse.Cloud.httpRequest`; the H1c test skips gracefully with the observation if that happens live.
+- `test/helpers.mjs`: per-execution RUN prefix (`zz` + base36 time + hex) on every username and tenant name;
+  remote mode loads `.env.live`, applies the schema via `setupSchema`, routes every `h.master()` state
+  read-back through `testInspect`, and tears down through `testCleanup(RUN)`. Evidence rows/files are labeled
+  by the actual target (`back4app` only for a back4app.com TEST_SERVER_URL; a localhost rehearsal is labeled
+  `remote-rehearsal` and is not committed).
+- Live skips, each with a printed reason: T5 (master writes + SQL corruption), T4(c)/T12-expiry/T15-racing
+  master sub-parts (observations note the skip), L1/C3/R5 (failure simulations need master-key row edits),
+  T8/T9lq unless LIVEQUERY_URL is set, demo-unguarded entirely. The skipped matrix rows point at the local
+  evidence file.
+- New: `scripts/measure-revocation.mjs` (H2) and `scripts/measure-scale.mjs` (H3/H4, one factor per
+  invocation), CSV output labeled by target; `scripts/lib/seed-identity.mjs` shared with seed-tenants.
+
+**Rehearsal (dev server via TEST_SERVER_URL + REST key, NO master key): 30 pass / 5 skipped / 0 fail.**
+testInspect carried the ACL and relation assertions; testCleanup removed each suite's exact tally (e.g.
+`{"tenants":2,"users":10,"sessions":10}`); LiveQuery ran through LIVEQUERY_URL. H2 proof (2 local runs):
+first refused fresh read 3–4 ms after removeMember returned; LQ last event ~4.6 s (the 5 s auth cache again).
+Scale proof (tiny local numbers): mechanics fine, p50/p95/errors per row. The local proof CSVs were deleted —
+the brief marks H2 delay and H3/H4 as live numbers, and docs/evidence/ holds no locally produced CSV of them.
+One bug found by the proof: the H2 script originally matched LQ events by object id registered AFTER the
+create returned, losing the race against event delivery; it now counts any event on the run's own tenant.
+
+**Expected differences on MongoDB/Back4app (watch for these live)**
+
+- CLP/ACL refusal code pairs (local Postgres: find 101 on member classes, 119 on master-only; get 101/119) may
+  differ; the tests assert codes observed locally — a live mismatch is a finding for local-vs-live.md, not
+  necessarily a bug.
+- Index creation: Parse.Schema indexes landed with directions preserved on MongoDB in the sibling repo, but
+  its diary also warns about `createdAt` index keys; check the Index Manager after setupSchema.
+- T5 read side needs a Mongo-side corruption method (dashboard data browser can write the raw pointer);
+  include-ACL behaviour (parse-server dropped the unreadable included object locally) must be re-verified —
+  it is version- and adapter-sensitive.
+- `getAttachment` depends on global fetch on Node 19 and on the decoded `file.url()` shape (locally it came
+  back relative with an `undefined` host and the function composes the URL from `Parse.serverURL`); H1 raw-URL
+  behaviour on Back4app's file store is the headline measurement either way.
+- LiveQuery: wss host + per-class enablement are dashboard settings; the auth-cache drain (~5 s locally) may
+  differ with Back4app's cache configuration — that IS the H2 measurement.
+- Throttle: the REST client retries Parse 155 with backoff on live targets; seeding 1,000 tenants ×100 tasks
+  is ~100k requests — far beyond the Free plan's 25K/month. Expect to stop early and report the tested
+  maximum (brief decision 4), or upgrade first.

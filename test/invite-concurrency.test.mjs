@@ -80,7 +80,8 @@ test('C2 ten parallel accepts, two different users racing: exactly one wins, the
   });
 });
 
-test('C3 half-failed accept (consumed, membership missing): the SAME user\'s retry repairs it', async () => {
+test('C3 half-failed accept (consumed, membership missing): the SAME user\'s retry repairs it', async (t) => {
+  if (h.liveSkip(t, 'simulating the crash needs master-key row edits — recorded in the local evidence')) return;
   const u = await h.signUp('c3_user');
   const inv = await mustCall(h, 'invite', { tenantId: w.acme, email: u.email, role: 'member' }, w.acmeAdmin.token);
   await mustCall(h, 'acceptInvite', { token: inv.token }, u.token);

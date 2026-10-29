@@ -13,6 +13,8 @@
     "dev:server": "node scripts/dev-server.mjs",
     "setup": "node scripts/setup.mjs",
     "seed:tenants": "node scripts/seed-tenants.mjs",
+    "measure:h2": "node scripts/measure-revocation.mjs",
+    "measure:scale": "node scripts/measure-scale.mjs",
     "pretest": "node scripts/evidence.mjs --reset",
     "test": "node --test --test-concurrency=1 'test/*.test.mjs'",
     "posttest": "node scripts/evidence.mjs"

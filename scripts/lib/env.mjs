@@ -34,8 +34,26 @@ export function loadDotEnv(file = path.join(ROOT, '.env')) {
   return true;
 }
 
-/** Target selection: `--local` (or TARGET=local) → the local dev server; otherwise the backend from .env. */
+/**
+ * Target selection: `--local` (or TARGET=local) → the local dev server; `--live` → the Back4app backend from
+ * .env.live (keys are never printed); otherwise the backend from .env, falling back to LOCAL.
+ */
 export function target(a = args()) {
+  if (a.live) {
+    if (!loadDotEnv(path.join(ROOT, '.env.live'))) {
+      console.error('--live: no .env.live found. It must hold APP_ID, JS_KEY, REST_KEY, SERVER_URL.');
+      process.exit(2);
+    }
+    if (!process.env.APP_ID) { console.error('--live: .env.live has no APP_ID.'); process.exit(2); }
+    return {
+      name: 'back4app',
+      APP_ID: process.env.APP_ID,
+      JS_KEY: process.env.JS_KEY || '',
+      REST_KEY: process.env.REST_KEY || '',
+      MASTER_KEY: '', // the master key stays in the dashboard; everything privileged runs inside Cloud Code
+      SERVER_URL: (process.env.SERVER_URL || 'https://parseapi.back4app.com').replace(/\/+$/, ''),
+    };
+  }
   loadDotEnv();
   if (a.local || process.env.TARGET === 'local' || !process.env.APP_ID) {
     if (!a.local && process.env.TARGET !== 'local' && !process.env.APP_ID) {

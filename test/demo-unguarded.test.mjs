@@ -13,12 +13,14 @@ const { harness, mustCall } = await import('./helpers.mjs');
 
 let h; let w;
 before(async () => {
+  if (process.env.TEST_SERVER_URL) return; // skipped on live targets (see the test body)
   h = await harness({ suite: 'demo-unguarded' });
   w = await h.world();
 });
-after(async () => { await h.cleanup(); });
+after(async () => { if (h) await h.cleanup(); });
 
-test('T10 (demo half) the unguarded function leaks a Borealis task to an ACME member; the guarded version refuses', async () => {
+test('T10 (demo half) the unguarded function leaks a Borealis task to an ACME member; the guarded version refuses', async (t) => {
+  if (process.env.TEST_SERVER_URL) { t.skip('live run: the demo flag must never be set on a shared backend — the default-deploy half (141) runs live as T10'); return; }
   // The vulnerable version: authentication alone, no membership check, master-key read.
   const leak = await h.call('demoTaskById', { taskId: w.borealisTask }, w.acmeMember.token);
   assert.equal(leak.ok, true, 'the unguarded function answers');

@@ -4,7 +4,7 @@
 // memberships). The deletion claim covers the live API only — never backups or platform logs (README).
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { harness, mustCall } from './helpers.mjs';
+import { harness, mustCall, RUN } from './helpers.mjs';
 
 let h; let w;
 before(async () => {
@@ -38,7 +38,7 @@ test('T9 (fresh requests) removing a member: every fresh request after removeMem
   // The session itself stays valid (removal ≠ sign-out) and the task the victim created stays with the tenant.
   assert.equal((await h.rest('GET', '/users/me', undefined, { session: victim.token })).status, 200);
   assert.equal((await h.master('Task', { objectId: task.id }))[0].title, 'T9 victim task');
-  await h.rest('DELETE', `/classes/Task/${task.id}`, undefined, { master: true }); // keep later counts clean
+  await mustCall(h, 'deleteTask', { taskId: task.id }, w.acmeAdmin.token); // keep later counts clean (admin passes the member guard)
   h.observe('T9 first refused fresh read', `${readMs} ms after removeMember returned (local; the open-subscription delay is live-only)`);
   h.record({
     id: 'T9', test: 'revocation of fresh requests', persona: 'removed member',
@@ -78,7 +78,8 @@ test('T9b dual-tenant and nested-role removal: losing ACME does not touch Boreal
   });
 });
 
-test('L1 removeMember is retryable: a half-failed removal (roles still granted) is finished by calling it again', async () => {
+test('L1 removeMember is retryable: a half-failed removal (roles still granted) is finished by calling it again', async (t) => {
+  if (h.liveSkip(t, 'simulating the half-failed removal needs a master-key role edit — recorded in the local evidence')) return;
   const victim = await h.addMember(w.acmeAdmin.token, w.acme, 'member', 'l1_victim');
   await mustCall(h, 'removeMember', { tenantId: w.acme, userId: victim.objectId }, w.acmeAdmin.token);
   // Simulate the half-failed case: the membership row is 'removed' but a role entry survived the crash.
@@ -116,7 +117,7 @@ test('T15 deleteTenant: paginated, interruptible (budget), retryable, idempotent
   // A disposable tenant rich enough to need several pages: 1 admin, 1 member who is ALSO an ACME member
   // (the shared user whose other membership must survive), 2 projects, 25 tasks, 1 attachment, 2 open invites.
   const admin = await h.signUp('t15_admin');
-  const doomed = (await mustCall(h, 'createTenant', { name: 'Doomed ' + Date.now() }, admin.token)).tenantId;
+  const doomed = (await mustCall(h, 'createTenant', { name: `Doomed ${RUN}` }, admin.token)).tenantId;
   const shared = await h.addMember(admin.token, doomed, 'member', 't15_shared');
   const invA = await mustCall(h, 'invite', { tenantId: w.acme, email: shared.email, role: 'member' }, w.acmeAdmin.token);
   await mustCall(h, 'acceptInvite', { token: invA.token }, shared.token);
@@ -137,8 +138,12 @@ test('T15 deleteTenant: paginated, interruptible (budget), retryable, idempotent
   // During the partial state: new writes into the tenant are refused (concurrent-writes case, amendment 11)…
   const during = await h.call('createTask', { tenantId: doomed, projectId: p1, title: 'racing the delete' }, shared.token);
   assert.equal(during.error.code, 'TENANT_DELETING');
-  const masterDuring = await h.rest('POST', '/classes/Task', { tenant: ptr('Tenant', doomed), project: ptr('Project', p1), title: 'master racing' }, { master: true });
-  assert.match(masterDuring.json.error, /TENANT_DELETING/, '…even with the master key (the hook, not the guard)');
+  if (h.canMaster) {
+    const masterDuring = await h.rest('POST', '/classes/Task', { tenant: ptr('Tenant', doomed), project: ptr('Project', p1), title: 'master racing' }, { master: true });
+    assert.match(masterDuring.json.error, /TENANT_DELETING/, '…even with the master key (the hook, not the guard)');
+  } else {
+    h.observe('T15 master-key write during deletion', 'SKIP live: needs the master key — hook refusal proven in the local run');
+  }
   // …and the OTHER tenant is untouched mid-deletion.
   assert.equal((await h.master('Task', { tenant: ptr('Tenant', w.acme) })).length, 2);
 
@@ -156,7 +161,8 @@ test('T15 deleteTenant: paginated, interruptible (budget), retryable, idempotent
     assert.equal((await h.master(cls, { tenant: ptr('Tenant', doomed) })).length, 0, `${cls}: no rows left`);
   }
   assert.equal((await h.master('Tenant', { objectId: doomed })).length, 0, 'tenant row gone');
-  assert.equal((await h.master('_Role', { name: { $in: [`tenant_${doomed}_member`, `tenant_${doomed}_admin`] } })).length, 0, 'both roles gone');
+  assert.equal((await h.master('_Role', { name: `tenant_${doomed}_member` })).length, 0, 'member role gone');
+  assert.equal((await h.master('_Role', { name: `tenant_${doomed}_admin` })).length, 0, 'admin role gone');
   const file = await fetch(att.url);
   assert.ok([404, 403].includes(file.status), `the attachment URL no longer serves (HTTP ${file.status})`);
 

@@ -38,7 +38,9 @@ cloud/main.js          17 Cloud functions (the single write path) + the beforeSa
 scripts/dev-server.mjs local parse-server 7.5.4: Postgres on 5433, LiveQuery for Task, fs files adapter, request log
 scripts/setup.mjs      schema + CLPs: master key locally; Cloud function setupSchema (SETUP_ENABLED) on a live backend
 scripts/seed-tenants.mjs  N tenants through the real client path (no master key), 16 req/s token bucket, resumable
-scripts/evidence.mjs   turns the rows the tests record into docs/evidence/isolation-matrix-local-<date>.md + files-h1…
+scripts/measure-revocation.mjs  H2: removeMember → first refused fresh read + LiveQuery drain, CSV per run
+scripts/measure-scale.mjs       H3/H4: one seeded caller, one timed query (20 warm-ups + 100 runs, p50/p95), CSV row
+scripts/evidence.mjs   turns the rows the tests record into docs/evidence/isolation-matrix-<target>-<date>.md + files-h1…
 scripts/lib/           env/target selection, raw REST client (throttle retry, token bucket)
 test/                  node:test suites, raw REST + raw websockets, no SDK: isolation, positive, roles, lifecycle,
                        invite-concurrency, files-h1, livequery, demo-unguarded (own process, DEMO_UNGUARDED=1)
@@ -65,24 +67,42 @@ The T10 demonstration (`demoTaskById`, the function that forgets the membership 
 `DEMO_UNGUARDED=1` is set in the environment of a throwaway server; the suite proves both halves: 141
 "Invalid function" by default, and the leak + the fixed `getTask` in a separate flagged process.
 
-## Pointing it at a live backend — LATER
+## Running against the live backend (the operator does this — nothing in this repo has)
 
-The live phase (Back4app run of the same suites, H2 revocation-delay distribution, H3/H4 scale measurements,
-storage per tenant) is deliberately **not** part of this repository state. When the coordinator opens it:
+The keys live in `.env.live` (gitignored; APP_ID, JS_KEY, REST_KEY, CLIENT_KEY, SERVER_URL). The master key is
+never needed: the schema, every state read-back and the teardown go through SETUP_ENABLED-gated Cloud
+functions (`setupSchema`, `testInspect`, `testCleanup`). Every run stamps its own `zz…` prefix on all
+usernames and tenant names; `testCleanup` only ever deletes tenants carrying that prefix and users younger
+than 2 h whose username starts with it, so parallel or crashed runs never collide.
 
-1. Create a backend app, copy App ID + JS/REST key into `.env` (leave `MASTER_KEY` empty — everything
-   privileged runs inside Cloud Code).
-2. Upload `cloud/main.js`, `cloud/config.js` **and** `cloud/guards.js` in the Cloud Code editor, confirm the
-   "Files pending deploy (3)" badge, Deploy — and prove it with a request, never with the dialog:
-   `POST /functions/myTenants` must answer `{"code":209,…}`; `141 Invalid function` means it did not ship
-   (the sibling repos hit a first-deploy-ships-nothing quirk on fresh backends: reload the editor, make each
-   file dirty, confirm the badge, Deploy again).
-3. `npm run setup` (no master key → calls `setupSchema`, gated by `cloud/config.js` `SETUP_ENABLED`).
-4. `TEST_SERVER_URL=https://parseapi.back4app.com npm test` — note the suites currently purge and master-read
-   only locally; the live run needs the gated inspection/cleanup helpers to be added (open point for the live
-   phase, see the diary).
-5. Before the backend has real tenants: `SETUP_ENABLED = false` in `cloud/config.js`, re-upload, Deploy,
-   verify you get `SETUP_DISABLED`.
+1. **Deploy Cloud Code** — upload `cloud/main.js`, `cloud/config.js` **and** `cloud/guards.js` (three files;
+   `cloud/package.json` is not needed), confirm the badge "Files pending deploy (3)", Deploy. Prove it with a
+   request, never with the dialog: `POST /functions/myTenants` with the REST key must answer `{"code":209,…}`;
+   `141 Invalid function` means it did not ship (known first-deploy quirk: reload the editor, make each file
+   dirty, confirm the badge, Deploy again).
+2. **Schema**: `npm run setup -- --live` (reads `.env.live`, calls `setupSchema`, prints the probe).
+3. **The suite**: `TEST_SERVER_URL=https://parseapi.back4app.com npm test`
+   — regenerates `docs/evidence/isolation-matrix-back4app-<date>.md` and `files-h1-back4app-<date>.md`.
+   Parts needing the master key or SQL (hook-vs-master probes, failure simulations, T5 corruption) skip with a
+   printed reason; the local evidence file holds those rows. For T8/T9 LiveQuery: enable class `Task` under
+   App Settings → Server Settings → Live Query, then prepend `LIVEQUERY_URL=wss://<subdomain>.b4a.io`.
+4. **H2** (revocation delay, 10 runs): `LIVEQUERY_URL=wss://<subdomain>.b4a.io npm run measure:h2 -- --live --runs 10`
+   → `docs/evidence/revocation-h2-back4app-<date>.csv` (+ min/median/max printed).
+5. **H3/H4** (one factor at a time):
+   ```bash
+   npm run seed:tenants -- --live --tenants 1 --tasks 100            # state: 1 tenant
+   npm run measure:scale -- --live --label tenants-1 --user admin-0
+   npm run seed:tenants -- --live --tenants 1000 --tasks 100         # state: 1,000 tenants (resumable: --from N; watch the Free-plan quota)
+   npm run measure:scale -- --live --label tenants-1000 --user admin-0
+   npm run seed:tenants -- --live --join 1   && npm run measure:scale -- --live --label memberships-1  --user joiner
+   npm run seed:tenants -- --live --join 10  && npm run measure:scale -- --live --label memberships-10 --user joiner
+   npm run seed:tenants -- --live --join 50  && npm run measure:scale -- --live --label memberships-50 --user joiner
+   ```
+   → rows in `docs/evidence/scale-h3h4-back4app-<date>.csv`. Record Plan Usage before/after seeding for the
+   storage-per-tenant estimate. Seeded data is NOT removed by the suite's cleanup (different prefix, by
+   design — the scale state must persist between measurements).
+6. **Before the backend has real tenants**: set `SETUP_ENABLED = false` in `cloud/config.js`, re-upload,
+   Deploy, and verify the gate: `setupSchema` must answer `SETUP_DISABLED`.
 
 ## Security model in one paragraph
 
