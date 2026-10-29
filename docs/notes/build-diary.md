@@ -171,3 +171,14 @@ create returned, losing the race against event delivery; it now counts any event
 - Throttle: the REST client retries Parse 155 with backoff on live targets; seeding 1,000 tenants ×100 tasks
   is ~100k requests — far beyond the Free plan's 25K/month. Expect to stop early and report the tested
   maximum (brief decision 4), or upgrade first.
+
+## 2026-10-29 evening — seeding throughput is backend-capped (live observation)
+
+Seeding 1,000 tenants × 100 tasks through the single write path (createTask, membership guard + hooks) is
+capped by the backend, not the client. One sequential seeder with a 16 req/s budget achieved ~1.9 req/s
+(latency-bound at ~520 ms/request). Eight parallel slices at 2 req/s each did NOT raise the aggregate:
+~1.7 req/s total, and /health p50 rose from ~0.43 s to ~1.2 s under that concurrency — the MVP instance
+queues. Numbers to restate next to H3: requests go through Cloud functions (double write: object + guard
+reads), one instance, USA East. The first seeder run also died once at tenant 240 with UND_ERR_SOCKET
+("other side closed") that escaped the retry wrapper (thrown as fetch TypeError); the slice driver retries
+the whole process, and seeding is resumable by design (deterministic usernames, skip-if-exists).
